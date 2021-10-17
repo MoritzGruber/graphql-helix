@@ -1,100 +1,66 @@
-import { isLiveQueryOperationDefinitionNode } from "@n1ru4l/graphql-live-query";
 import copyToClipboard from "copy-to-clipboard";
-import { DocumentNode, Kind, parse } from "graphql";
-import GraphiQL, { Fetcher } from "graphiql";
+import GraphiQLExplorer from "graphiql-explorer";
+import GraphiQL from "graphiql";
+import fetch from "isomorphic-fetch";
 import * as React from "react";
 import * as ReactDOM from "react-dom";
-import { LoadFromUrlOptions, UrlLoader } from "@graphql-tools/url-loader";
-import { isAsyncIterable } from "@graphql-tools/utils";
-import { AsyncExecutor, Subscriber } from "@graphql-tools/delegate";
-import { ToolbarDropDown } from "./drop-down";
+import { buildClientSchema, getIntrospectionQuery, parse } from "graphql";
 
-export type HybridSubscriptionTransportConfig = {
-  /* Enable SSE transport as an option */
-  sse?: string;
-  /* Enable Legacy graphql-ws protocol transport as an option. */
-  legacyWS?: string;
-  /* Enable graphql-transport-ws protocol transport as an option */
-  transportWS?: string;
+function switchProtocols(pointer: string, protocolMap: Record<string, string>): string {
+  return Object.entries(protocolMap).reduce(
+    (prev, [source, target]) => prev.replace(`${source}://`, `${target}://`).replace(`${source}:\\`, `${target}:\\`),
+    pointer
+  );
+}
+
+const prepareGETUrl = ({
+  baseUrl,
+  query,
+  variables,
+  operationName,
+  extensions,
+}: {
+  baseUrl: string;
+  query: string;
+  variables: any;
+  operationName?: string;
+  extensions?: any;
+}) => {
+  const HTTP_URL = switchProtocols(baseUrl, {
+    wss: "https",
+    ws: "http",
+  });
+  const dummyHostname = "https://dummyhostname.com";
+  const validUrl = HTTP_URL.startsWith("http")
+    ? HTTP_URL
+    : HTTP_URL.startsWith("/")
+    ? `${dummyHostname}${HTTP_URL}`
+    : `${dummyHostname}/${HTTP_URL}`;
+  const urlObj = new URL(validUrl);
+  urlObj.searchParams.set("query", query);
+  if (variables && Object.keys(variables).length > 0) {
+    console.log(` JSON.stringify(variables)`, JSON.stringify(variables), variables);
+    urlObj.searchParams.set("variables", variables);
+  }
+  if (operationName) {
+    urlObj.searchParams.set("operationName", operationName);
+  }
+  if (extensions) {
+    urlObj.searchParams.set("extensions", JSON.stringify(extensions));
+  }
+  const finalUrl = urlObj.toString().replace(dummyHostname, "");
+  return finalUrl;
 };
+
 export interface Options {
   defaultQuery?: string;
   defaultVariableEditorOpen?: boolean;
   endpoint?: string;
   headers?: string;
   headerEditorEnabled?: boolean;
-  subscriptionsEndpoint?: string;
-  useWebSocketLegacyProtocol?: boolean;
-  hybridSubscriptionTransportConfig?: {
-    default: keyof HybridSubscriptionTransportConfig;
-    config: HybridSubscriptionTransportConfig;
-  };
 }
 
-const getOperationWithFragments = (
-  document: DocumentNode,
-  operationName: string
-): {
-  document: DocumentNode;
-  isSubscriber: boolean;
-} => {
-  let isSubscriber = false;
-  const definitions = document.definitions.filter((definition) => {
-    if (definition.kind === Kind.OPERATION_DEFINITION) {
-      if (operationName) {
-        if (definition.name?.value !== operationName) {
-          return false;
-        }
-      }
-      if (definition.operation === "subscription" || isLiveQueryOperationDefinitionNode(definition)) {
-        isSubscriber = true;
-      }
-    }
-    return true;
-  });
-  return {
-    document: {
-      kind: Kind.DOCUMENT,
-      definitions,
-    },
-    isSubscriber,
-  };
-};
 
-const buildHybridMenuOptions = (hybridConfig: HybridSubscriptionTransportConfig) => {
-  const options: Array<{
-    title: string;
-    value: keyof HybridSubscriptionTransportConfig;
-    url: string;
-  }> = [];
-  if (hybridConfig.sse) {
-    options.push({
-      value: "sse",
-      title: "Subscriptions with SSE",
-      url: hybridConfig.sse,
-    });
-  }
-  if (hybridConfig.transportWS) {
-    options.push({
-      value: "transportWS",
-      title: "Subscriptions with GraphQL over WebSocket",
-      url: hybridConfig.transportWS,
-    });
-  }
-  if (hybridConfig.legacyWS) {
-    options.push({
-      value: "legacyWS",
-      title: "Subscriptions with GraphQL over WebSocket",
-      url: hybridConfig.legacyWS,
-    });
-  }
-
-  if (options.length === 0) {
-    return null;
-  }
-
-  return options;
-};
 
 export const init = async ({
   defaultQuery,
@@ -102,86 +68,121 @@ export const init = async ({
   endpoint = "/graphql",
   headers = "{}",
   headerEditorEnabled = true,
-  subscriptionsEndpoint = endpoint,
-  useWebSocketLegacyProtocol,
-  hybridSubscriptionTransportConfig,
 }: Options = {}): Promise<void> => {
-  const urlLoader = new UrlLoader();
+
+  function graphQLFetcher(graphQLParams) {
+    return fetch(endpoint, {
+      method: "post",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(graphQLParams),
+    }).then((response) => response.json());
+  }
 
   const searchParams = new URLSearchParams(window.location.search);
   const initialOperationName = searchParams.get("operationName") || undefined;
-  const initialQuery = searchParams.get("query") || undefined;
+  const initialQuery = searchParams.get("query") || defaultQuery ||  undefined;
   const initialVariables = searchParams.get("variables") || "{}";
-
-  const menuOptions = hybridSubscriptionTransportConfig && buildHybridMenuOptions(hybridSubscriptionTransportConfig.config);
-  let startHybridIndex: null | number = null;
-  if (hybridSubscriptionTransportConfig && menuOptions) {
-    startHybridIndex = menuOptions.findIndex((option) => option.value === hybridSubscriptionTransportConfig.default);
-    if (startHybridIndex === -1) {
-      startHybridIndex = 0;
-    }
-  }
 
   ReactDOM.render(
     React.createElement(() => {
       const graphiqlRef = React.useRef<GraphiQL | null>(null);
+      const [state, setState] = React.useState({
+        schema: null,
+        query: initialQuery,
+        variables: initialVariables,
+        operationName: initialOperationName,
+        explorerIsOpen: false,
+      } as {
+        variables: any;
+        schema: any;
+        operationName: any;
+        query: any;
+        explorerIsOpen: boolean;
+      });
 
-      const [hybridTransportIndex, setHybridTransportIndex] = React.useState(startHybridIndex);
-      const [networkInterface, setNetworkInterface] = React.useState<null | {
-        executor: AsyncExecutor;
-        subscriber: Subscriber;
-      }>(null);
-
-      React.useEffect(() => {
-        let isCanceled = false;
-        const options: LoadFromUrlOptions = {
-          useSSEForSubscription: !subscriptionsEndpoint?.startsWith("ws"),
-          specifiedByUrl: true,
-          directiveIsRepeatable: true,
-          schemaDescription: true,
-          subscriptionsEndpoint,
-          useWebSocketLegacyProtocol,
-          headers: (executionParams) => executionParams?.context?.headers || JSON.parse(headers),
-        };
-
-        if (menuOptions && hybridTransportIndex) {
-          const target = menuOptions[hybridTransportIndex];
-          if (target.value === "sse") {
-            options.useSSEForSubscription = true;
-            options.subscriptionsEndpoint = target.url;
-            useWebSocketLegacyProtocol = undefined;
-          } else if (target.value === "legacyWS") {
-            options.useSSEForSubscription = false;
-            options.subscriptionsEndpoint = target.url;
-            useWebSocketLegacyProtocol = true;
-          } else if (target.value === "transportWS") {
-            options.useSSEForSubscription = false;
-            options.subscriptionsEndpoint = target.url;
-            useWebSocketLegacyProtocol = false;
-          }
+      const _handleInspectOperation = (cm: any, mousePos: { line: Number; ch: Number }) => {
+        let parsedQuery;
+        try {
+          parsedQuery = parse(state.query || "");
+        } catch (error) {
+          console.error("Error parsing query: ", error);
+          return;
+        }
+        if (!parsedQuery) {
+          console.error("Couldn't parse query document");
+          return null;
         }
 
-        urlLoader
-          .getExecutorAndSubscriberAsync(endpoint, options)
-          .then((networkInterface) => {
-            if (isCanceled) {
-              return;
-            }
-            setNetworkInterface(networkInterface);
-          })
-          // eslint-disable-next-line no-console
-          .catch(console.error);
-
-        return () => {
-          isCanceled = true;
+        var token = cm.getTokenAt(mousePos);
+        var start = { line: mousePos.line, ch: token.start };
+        var end = { line: mousePos.line, ch: token.end };
+        var relevantMousePos = {
+          start: cm.indexFromPos(start),
+          end: cm.indexFromPos(end),
         };
-      }, [menuOptions, hybridTransportIndex]);
+
+        var position = relevantMousePos;
+
+        var def = parsedQuery.definitions.find((definition) => {
+          if (!definition.loc) {
+            console.log("Missing location information for definition");
+            return false;
+          }
+
+          const { start, end } = definition.loc;
+          return start <= position.start && end >= position.end;
+        });
+
+        if (!def) {
+          console.error("Unable to find definition corresponding to mouse position");
+          return null;
+        }
+
+        var operationKind =
+          def.kind === "OperationDefinition" ? def.operation : def.kind === "FragmentDefinition" ? "fragment" : "unknown";
+
+        var operationName =
+          def.kind === "OperationDefinition" && !!def.name
+            ? def.name.value
+            : def.kind === "FragmentDefinition" && !!def.name
+            ? def.name.value
+            : "unknown";
+
+        var selector = `.graphiql-explorer-root #${operationKind}-${operationName}`;
+
+        var el = document.querySelector(selector);
+        el && el.scrollIntoView();
+      };
+
+      React.useEffect(() => {
+        graphQLFetcher({
+          query: getIntrospectionQuery(),
+        }).then((result) => {
+          const editor = graphiqlRef?.current?.getQueryEditor();
+          if(editor){
+            editor.setOption('extraKeys', {
+              ...(editor.options.extraKeys || {}),
+              'Shift-Alt-LeftClick': _handleInspectOperation,
+            });
+          }
+
+          setState((state) => ({ ...state, schema: buildClientSchema(result.data) }));
+        });
+      }, []);
+
+      const _handleEditQuery = (query: string): void => {
+        setState((state) => ({ ...state, query }));
+      };
+
+      const _handleToggleExplorer = () => {
+        setState((state) => ({ ...state, explorerIsOpen: !state.explorerIsOpen }));
+      };
 
       const onShare = () => {
         const state = graphiqlRef.current?.state;
 
         copyToClipboard(
-          urlLoader.prepareGETUrl({
+          prepareGETUrl({
             baseUrl: window.location.href,
             query: state?.query || "",
             variables: state?.variables,
@@ -190,97 +191,35 @@ export const init = async ({
         );
       };
 
-      const fetcher = React.useMemo<null | Fetcher>(() => {
-        if (!networkInterface) {
-          return null;
-        }
-        const { subscriber, executor } = networkInterface;
-        return (graphQLParams, opts) => ({
-          subscribe: (observer) => {
-            let stopSubscription = () => {};
-            Promise.resolve().then(async () => {
-              try {
-                const { document: filteredDocument, isSubscriber } = getOperationWithFragments(
-                  parse(graphQLParams.query),
-                  graphQLParams.operationName
-                );
-                const executionParams = {
-                  document: filteredDocument,
-                  variables: graphQLParams.variables,
-                  context: {
-                    headers: opts?.headers || {},
-                  },
-                };
-                const queryFn: any = isSubscriber ? subscriber : executor;
-                const res = await queryFn(executionParams);
-                if (isAsyncIterable(res)) {
-                  const asyncIterable = res[Symbol.asyncIterator]();
-                  if (asyncIterable.return) {
-                    stopSubscription = () => {
-                      asyncIterable.return!();
-                      observer.complete();
-                    };
-                  }
-                  for await (const part of res) {
-                    observer.next(part);
-                  }
-                  observer.complete();
-                } else if (typeof observer === "function") {
-                  observer(res);
-                } else {
-                  observer.next(res);
-                  observer.complete();
-                }
-              } catch (error: any) {
-                let errorResult: any;
-
-                if (typeof error.json === "function") {
-                  errorResult = await error.json();
-                } else {
-                  errorResult = error;
-                }
-                if (typeof observer === "function") {
-                  throw errorResult;
-                } else {
-                  observer.error(errorResult);
-                }
-              }
-            });
-            return { unsubscribe: () => stopSubscription() };
-          },
-        });
-      }, [networkInterface]);
-
-      return fetcher ? (
-        <GraphiQL
-          defaultQuery={defaultQuery}
-          defaultVariableEditorOpen={defaultVariableEditorOpen}
-          fetcher={fetcher}
-          headers={headers}
-          headerEditorEnabled={headerEditorEnabled}
-          operationName={initialOperationName}
-          query={initialQuery}
-          ref={graphiqlRef}
-          toolbar={{
-            additionalContent: (
-              <>
-                <button className="toolbar-button" onClick={onShare}>
-                  Copy Link
-                </button>
-                {menuOptions && hybridTransportIndex != null && (
-                  <ToolbarDropDown
-                    options={menuOptions}
-                    activeOptionIndex={hybridTransportIndex}
-                    onSelectOption={(index) => {
-                      setHybridTransportIndex(index);
-                    }}
-                  />
-                )}
-              </>
-            ),
-          }}
-          variables={initialVariables}
-        />
+      return graphQLFetcher ? (
+        <div className="graphiql-container">
+          <GraphiQLExplorer
+            schema={state.schema}
+            query={state.query}
+            onEdit={_handleEditQuery}
+            explorerIsOpen={state.explorerIsOpen}
+            onToggleExplorer={_handleToggleExplorer}
+          />
+          <GraphiQL
+            defaultQuery={state.query}
+            defaultVariableEditorOpen={defaultVariableEditorOpen}
+            fetcher={graphQLFetcher}
+            headers={headers}
+            variables={state.variables}
+            headerEditorEnabled={headerEditorEnabled}
+            operationName={state.operationName}
+            query={state.query}
+            ref={graphiqlRef}
+            toolbar={{
+              additionalContent: (
+                <>
+                  <GraphiQL.Button label="Copy Link" title="Copy Link" onClick={onShare} />
+                  <GraphiQL.Button onClick={_handleToggleExplorer} label="Explorer" title="Toggle Explorer" />
+                </>
+              ),
+            }}
+          />
+        </div>
       ) : null;
     }, {}),
     document.body
